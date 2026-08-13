@@ -5,6 +5,7 @@ from pathlib import Path
 from tree_sitter import Language, Parser
 import tree_sitter_python as tspython
 import anthropic
+from utils import print_tree, print_diagnostics
 
 PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
@@ -50,13 +51,6 @@ def generate_replacement(client, original_code, instruction, prior_errors=None):
     )
     return resp.content[0].text.strip()
 
-def print_tree(node, source_bytes, indent=0):
-    text = source_bytes[node.start_byte:node.end_byte].decode()
-    snippet = text.split("\n")[0][:40]
-    print(f"{'  ' * indent}{node.type} [{node.start_point[0]}:{node.end_point[0]}] '{snippet}'")
-    for child in node.children:
-        print_tree(child, source_bytes, indent + 1)
-
 def edit_target(filepath, target_name, instruction, max_retries=3):
     filepath = Path(filepath)
     source_bytes = filepath.read_bytes()
@@ -86,6 +80,7 @@ def edit_target(filepath, target_name, instruction, max_retries=3):
             tmp_path = tmp.name
 
         diag_json = run_pyright(tmp_path)
+        print_diagnostics(diag_json, tmp_path)
         os.unlink(tmp_path)
 
         start_line = node.start_point[0]
