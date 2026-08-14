@@ -154,6 +154,9 @@ IGNORE_DIRS = {
     ".next", ".turbo", "vendor",
 }
 
+# Cap background didOpen so a huge monorepo can't OOM the language server.
+INDEX_FILE_CAP = 500
+
 TOOLS = [
     {
         "name": "read_file",
@@ -266,6 +269,7 @@ class LSPClient:
         self._notifications: queue.Queue[dict] = queue.Queue()
         self._next_id = 1
         self._id_lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._alive = True
 
         threading.Thread(
@@ -305,8 +309,9 @@ class LSPClient:
         msg_id = payload.get("id", "-")
         lsp_logger.debug(f"--> [{self.cmd[0]}] id={msg_id} method={method}")
         try:
-            self.proc.stdin.write(header + body)
-            self.proc.stdin.flush()
+            with self._write_lock:
+                self.proc.stdin.write(header + body)
+                self.proc.stdin.flush()
         except (BrokenPipeError, OSError) as e:
             lsp_logger.error(f"write failed for {method}: {e}")
             raise RuntimeError(f"LSP server process died: {e}")
@@ -372,6 +377,10 @@ class LSPClient:
     def notify(self, method: str, params: dict):
         self._write_message({"jsonrpc": "2.0", "method": method, "params": params})
 
+    def reply(self, msg_id, result=None):
+        """Respond to a server->client request (workspace/configuration, etc.)."""
+        self._write_message({"jsonrpc": "2.0", "id": msg_id, "result": result})
+
     def get_notification(self, timeout: float = 0.0) -> dict | None:
         """Non-blocking-by-default pop from the notification queue."""
         try:
@@ -417,6 +426,10 @@ class LSPManager:
         language_id: str               # LSP "languageId" for didOpen
         extensions: tuple[str, ...]    # which files this server should be asked about
         init_options: dict = field(default_factory=dict)   # merged into initialize params
+        # Client settings tree. Pyright reads diagnosticMode from
+        # workspace/configuration ("python.analysis") or from
+        # workspace/didChangeConfiguration — NOT from init_options.
+        settings: dict = field(default_factory=dict)
 
     # Real class attributes — built once when the class is defined, shared
     # across every LSPManager instance. This is what was broken before:
@@ -431,12 +444,15 @@ class LSPManager:
             cmd=["npx", "-y", "-p", "pyright", "pyright-langserver", "--stdio"],
             language_id="python",
             extensions=(".py", ".pyi"),
-            # "openFilesOnly" (pyright's default) only analyzes files that
-            # got an explicit didOpen. "workspace" makes it analyze/publish
-            # diagnostics for the whole project on its own, so a background
-            # warm-start (see LSPManager.warm_start) actually produces a
-            # repo-wide pass instead of sitting idle until something is opened.
-            init_options={"python.analysis": {"diagnosticMode": "workspace"}},
+            settings={
+                "python": {
+                    "analysis": {
+                        "diagnosticMode": "workspace",
+                        "autoSearchPaths": True,
+                        "useLibraryCodeForTypes": True,
+                    }
+                }
+            },
         ),
         "typescript": ServerConfig(
             language="typescript",
@@ -481,6 +497,7 @@ class LSPManager:
         self._clients: dict[tuple, LSPClient] = {}   # keyed by tuple(cmd)
         self._opened_files: set[str] = set()          # absolute paths already didOpen'd
         self._diagnostics: dict[str, list] = {}        # uri -> diagnostics list (cache)
+        self._lock = threading.Lock()
 
     @staticmethod
     def _path_to_uri(path: str) -> str:
@@ -497,9 +514,10 @@ class LSPManager:
 
     def _client_for(self, cfg: ServerConfig) -> LSPClient:
         key = tuple(cfg.cmd)
-        client = self._clients.get(key)
-        if client is not None:
-            return client
+        with self._lock:
+            client = self._clients.get(key)
+            if client is not None:
+                return client
 
         client = LSPClient(cfg.cmd, cwd=self.root)
         lsp_logger.info(f"[{cfg.language}] sending initialize request...")
@@ -509,11 +527,24 @@ class LSPManager:
             {
                 "processId": os.getpid(),
                 "rootUri": self.root_uri,
+                "rootPath": self.root,
+                "workspaceFolders": [
+                    {"uri": self.root_uri, "name": Path(self.root).name}
+                ],
                 "capabilities": {
+                    "workspace": {
+                        "workspaceFolders": True,
+                        "configuration": True,
+                        "didChangeConfiguration": {"dynamicRegistration": False},
+                    },
+                    "window": {"workDoneProgress": True},
                     "textDocument": {
                         "synchronization": {"didSave": True},
                         "publishDiagnostics": {"relatedInformation": True},
-                    }
+                        "definition": {},
+                        "references": {},
+                        "hover": {},
+                    },
                 },
                 "initializationOptions": cfg.init_options,
             },
@@ -525,16 +556,10 @@ class LSPManager:
             f"[{cfg.language}] initialized in {init_elapsed:.2f}s "
             f"(server reports: {server_name})"
         )
-        client.notify("initialized", {})
-        self._clients[key] = client
 
-        # Start a dedicated background reader for this client's notification
-        # queue right away, rather than only draining it opportunistically
-        # from inside open_file_and_get_diagnostics. This is what makes
-        # workspace-wide diagnostics (see the python config's diagnosticMode)
-        # actually visible — pyright can start publishing diagnostics for
-        # files nobody has explicitly opened, and without this listener
-        # those notifications would just sit unread in the queue forever.
+        # Listener must be running before `initialized` — pyright immediately
+        # sends workspace/configuration and waits for the reply before it
+        # applies diagnosticMode=workspace.
         threading.Thread(
             target=self._notification_listener,
             args=(client, cfg),
@@ -542,26 +567,39 @@ class LSPManager:
             name=f"lsp-notify-{cfg.language}",
         ).start()
 
+        client.notify("initialized", {})
+        if cfg.settings:
+            client.notify("workspace/didChangeConfiguration", {"settings": cfg.settings})
+            lsp_logger.info(f"[{cfg.language}] sent workspace settings")
+
+        with self._lock:
+            existing = self._clients.get(key)
+            if existing is not None:
+                client.shutdown()
+                return existing
+            self._clients[key] = client
+
         return client
 
     def _notification_listener(self, client: LSPClient, cfg: ServerConfig):
         """
-        Runs for the lifetime of `client`. Every publishDiagnostics
-        notification updates self._diagnostics (so open_file_and_get_diagnostics
-        can just read the cache instead of racing this thread for messages
-        off the same queue), and logs a one-line summary so you can watch
-        the server doing work in the log file in real time.
+        Runs for the lifetime of `client`. Server->client requests (with an
+        id) get a reply; notifications update caches and the log.
         """
         while client._alive:
             note = client.get_notification(timeout=0.5)
             if note is None:
+                continue
+            if "id" in note and "method" in note:
+                self._handle_server_request(client, cfg, note)
                 continue
             method = note.get("method")
             if method == "textDocument/publishDiagnostics":
                 params = note.get("params", {})
                 uri = params.get("uri", "<unknown>")
                 diags = params.get("diagnostics", [])
-                self._diagnostics[uri] = diags
+                with self._lock:
+                    self._diagnostics[uri] = diags
                 rel = uri.removeprefix(self.root_uri).lstrip("/")
                 if diags:
                     lsp_logger.info(
@@ -573,15 +611,64 @@ class LSPManager:
                         msg = d.get("message", "").splitlines()[0][:120]
                         lsp_logger.debug(f"    L{line} sev={sev}: {msg}")
                 else:
-                    lsp_logger.debug(f"[{cfg.language}] diagnostics: {rel} — clean")
+                    lsp_logger.info(f"[{cfg.language}] diagnostics: {rel} — clean")
             elif method == "$/progress":
                 value = note.get("params", {}).get("value", {})
                 kind = value.get("kind")
                 title = value.get("title") or value.get("message")
                 if kind:
                     lsp_logger.info(f"[{cfg.language}] progress[{kind}]: {title}")
+            elif method == "window/logMessage":
+                params = note.get("params", {})
+                msg = (params.get("message") or "").strip()
+                if msg:
+                    lsp_logger.info(f"[{cfg.language}] {msg}")
             else:
                 lsp_logger.debug(f"[{cfg.language}] unhandled notification: {method}")
+
+    @staticmethod
+    def _settings_section(settings: dict, section: str | None):
+        if not section:
+            return settings
+        node = settings
+        for part in section.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return None
+            node = node[part]
+        return node
+
+    def _handle_server_request(self, client: LSPClient, cfg: ServerConfig, note: dict):
+        method = note.get("method")
+        msg_id = note["id"]
+        params = note.get("params") or {}
+        lsp_logger.debug(f"[{cfg.language}] server request: {method} id={msg_id}")
+        if method == "workspace/configuration":
+            items = params.get("items") or [{}]
+            result = [
+                self._settings_section(cfg.settings, item.get("section"))
+                for item in items
+            ]
+            lsp_logger.info(
+                f"[{cfg.language}] workspace/configuration -> "
+                + ", ".join(
+                    item.get("section") or "<all>" for item in items
+                )
+            )
+            client.reply(msg_id, result)
+        elif method == "workspace/workspaceFolders":
+            client.reply(
+                msg_id,
+                [{"uri": self.root_uri, "name": Path(self.root).name}],
+            )
+        elif method in (
+            "window/workDoneProgress/create",
+            "client/registerCapability",
+            "client/unregisterCapability",
+        ):
+            client.reply(msg_id, None)
+        else:
+            lsp_logger.warning(f"[{cfg.language}] unhandled server request: {method}")
+            client.reply(msg_id, None)
 
     def shutdown_all(self):
         lsp_logger.info("shutting down all LSP clients")
@@ -590,23 +677,102 @@ class LSPManager:
         self._clients.clear()
         self._opened_files.clear()
 
-    def warm_start(self, language: str) -> LSPClient | None:
+    def warm_start(self, language: str) -> int | None:
         """
-        Eagerly spawn + initialize the server for `language`, without
-        waiting for any tool call. Lets indexing happen in the background
-        while the agent is doing unrelated exploration (list_dir/read_file),
-        instead of only starting on the first ask_lsp/open_file call.
-
-        Meant to be called from a background thread (see Sandbox._warm_lsp) —
-        this blocks on the initialize handshake, so calling it synchronously
-        on the main thread would defeat the point.
+        Spawn + initialize the server, push workspace settings, then didOpen
+        source files so analysis/indexing overlaps the agent's explore turns.
+        Returns the number of files opened, or None if no server is configured.
         """
         cfg = self.SERVER_CONFIGS.get(language)
         if cfg is None:
             lsp_logger.warning(f"warm_start: no server configured for '{language}'")
-            return None  # no server configured for this language — nothing to warm
+            return None
         lsp_logger.info(f"warm_start: starting server for '{language}'")
-        return self._client_for(cfg)
+        self._client_for(cfg)
+        n = self.index_workspace(language)
+        self._wait_for_diagnostics(language, n)
+        lsp_logger.info(f"[{language}] warm_start opened {n} file(s) for indexing")
+        return n
+
+    def _wait_for_diagnostics(self, language: str, opened: int, timeout: float = 20.0):
+        """Block only the warm-start thread until diagnostics arrive or timeout."""
+        if opened == 0:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                n = len(self._diagnostics)
+            if n >= opened:
+                break
+            time.sleep(0.2)
+        with self._lock:
+            n = len(self._diagnostics)
+        lsp_logger.info(
+            f"[{language}] diagnostics received for {n} file(s) "
+            f"(opened {opened}, waited up to {timeout:.0f}s)"
+        )
+
+    def _iter_source_files(self, extensions: tuple[str, ...], max_files: int):
+        count = 0
+        for root, dirs, files in os.walk(self.root):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith(".")]
+            for fname in files:
+                if Path(fname).suffix not in extensions:
+                    continue
+                full = os.path.join(root, fname)
+                rel = os.path.relpath(full, self.root)
+                if os.sep != "/":
+                    rel = rel.replace(os.sep, "/")
+                yield rel
+                count += 1
+                if count >= max_files:
+                    return
+
+    def _did_open(self, rel_path: str, cfg: ServerConfig | None = None) -> str | None:
+        """Send textDocument/didOpen without waiting for diagnostics. Returns uri."""
+        full_path = str(Path(self.root, rel_path).resolve())
+        uri = self._path_to_uri(full_path)
+        with self._lock:
+            if full_path in self._opened_files:
+                return uri
+        ext = Path(full_path).suffix
+        cfg = cfg or self._config_for_extension(ext)
+        if cfg is None:
+            return None
+        client = self._client_for(cfg)
+        text = Path(full_path).read_text(errors="replace")
+        lsp_logger.debug(f"[{cfg.language}] didOpen: {rel_path}")
+        client.notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": cfg.language_id,
+                    "version": 1,
+                    "text": text,
+                }
+            },
+        )
+        with self._lock:
+            self._opened_files.add(full_path)
+        return uri
+
+    def index_workspace(self, language: str, max_files: int = INDEX_FILE_CAP) -> int:
+        cfg = self.SERVER_CONFIGS.get(language)
+        if cfg is None:
+            return 0
+        opened = 0
+        for rel in self._iter_source_files(cfg.extensions, max_files):
+            try:
+                if self._did_open(rel, cfg) is not None:
+                    opened += 1
+            except OSError as e:
+                lsp_logger.debug(f"[{language}] skip {rel}: {e}")
+        if opened >= max_files:
+            lsp_logger.warning(
+                f"[{language}] hit index cap of {max_files} files — rest left closed"
+            )
+        return opened
 
     # ---------- file open + diagnostics ----------
 
@@ -623,7 +789,9 @@ class LSPManager:
         """
         full_path = str(Path(self.root, rel_path).resolve())
         uri = self._path_to_uri(full_path)
-        if full_path in self._opened_files:
+        with self._lock:
+            already_open = full_path in self._opened_files
+        if already_open:
             return self._diagnostics.get(uri, [])
 
         ext = Path(full_path).suffix
@@ -631,22 +799,7 @@ class LSPManager:
         if cfg is None:
             raise ValueError(f"No LSP server configured for extension '{ext}'")
 
-        client = self._client_for(cfg)
-        text = Path(full_path).read_text(errors="replace")
-
-        lsp_logger.debug(f"[{cfg.language}] didOpen: {rel_path}")
-        client.notify(
-            "textDocument/didOpen",
-            {
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": cfg.language_id,
-                    "version": 1,
-                    "text": text,
-                }
-            },
-        )
-        self._opened_files.add(full_path)
+        self._did_open(rel_path, cfg)
 
         deadline = time.monotonic() + wait_timeout
         while time.monotonic() < deadline:
@@ -733,11 +886,15 @@ class Sandbox:
     def _warm_lsp(self):
         lsp_logger.info(f"Sandbox: warm-starting LSP for detected language '{self.language}'")
         try:
-            client = self.lsp.warm_start(self.language)
-            if client is None:
+            n = self.lsp.warm_start(self.language)
+            if n is None:
                 print(
                     f"{RED}[lsp] no server configured for language "
                     f"'{self.language}' — skipping warm start{RESET}"
+                )
+            else:
+                print(
+                    f"{RED}[lsp] '{self.language}' indexed {n} file(s){RESET}"
                 )
         except Exception as e:
             # Runs on a background thread — nothing is waiting on this, so
