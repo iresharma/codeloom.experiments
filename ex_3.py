@@ -1,6 +1,12 @@
+# An experiment to see if we can use tree-sitter and LSP to find the exact definition of a function, class, or method by name in a specific file, returning just that symbol's source code.
+
 import argparse
+import json
 import os
 import subprocess
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import tree_sitter_go as tsgo
@@ -12,6 +18,40 @@ from tree_sitter import Language, Parser
 
 MODEL = "claude-sonnet-4-6"
 MAX_TURNS = 25          # hard cap so a buggy loop can't run forever
+DEFAULT_PROFILE_LOG = Path(__file__).resolve().parent / "ex_3_profile.jsonl"
+
+# Terminal colors: agent=blue, user=green, tool=red
+BLUE = "\033[94m"
+GREEN = "\033[92m"
+RED = "\033[91m"
+RESET = "\033[0m"
+
+
+class ProfileLog:
+    """Append-only JSONL profiler. Console stays clean; graphs read this file."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.session_id = (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            + "-"
+            + uuid.uuid4().hex[:8]
+        )
+        self._seq = 0
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.event("session_start", model=MODEL)
+
+    def event(self, event: str, **fields):
+        self._seq += 1
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "session_id": self.session_id,
+            "seq": self._seq,
+            "event": event,
+            **fields,
+        }
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
 
 
 PY_LANGUAGE = Language(tspython.language())
@@ -205,26 +245,39 @@ class Sandbox:
         except Exception as e:
             return f"Error finding symbol '{symbol}' in '{path}': {e}"
 
-def execute_tool(sandbox: Sandbox, name: str, tool_input: dict) -> str:
-    """Name -> function dispatch. This is the whole 'engine'."""
+
+def execute_tool(sandbox: Sandbox, name: str, tool_input: dict):
+    """Name -> function dispatch. Returns (result, invoke_secs, run_secs)."""
+    invoke_start = time.perf_counter()
     if name == "read_file":
-        return sandbox.read_file(
+        fn = sandbox.read_file
+        args = (
             tool_input["path"],
             tool_input.get("start_line"),
             tool_input.get("end_line"),
         )
+        kwargs = {}
     elif name == "list_dir":
-        return sandbox.list_dir(tool_input.get("path", "."))
+        fn = sandbox.list_dir
+        args = (tool_input.get("path", "."),)
+        kwargs = {}
     elif name == "clone_repo":
-        return sandbox.clone_repo(tool_input["repo_url"])
+        fn = sandbox.clone_repo
+        args = (tool_input["repo_url"],)
+        kwargs = {}
     elif name == "find_symbol":
-        return sandbox.find_symbol(
-            tool_input["path"],
-            tool_input["symbol"],
-            tool_input["language"],
-        )
+        fn = sandbox.find_symbol
+        args = (tool_input["path"], tool_input["symbol"], tool_input["language"])
+        kwargs = {}
     else:
-        return f"Error: unknown tool '{name}'"
+        invoke_elapsed = time.perf_counter() - invoke_start
+        return f"Error: unknown tool '{name}'", invoke_elapsed, 0.0
+    invoke_elapsed = time.perf_counter() - invoke_start
+
+    run_start = time.perf_counter()
+    result = fn(*args, **kwargs)
+    run_elapsed = time.perf_counter() - run_start
+    return result, invoke_elapsed, run_elapsed
 
 
 SYSTEM_PROMPT = """You are a coding agent that explores and analyzes code repositories using a small set of tools. You operate inside a sandboxed working directory and cannot access anything outside it.
@@ -247,9 +300,11 @@ Working principles:
 
 When asked to analyze or answer questions about a repository, work step by step: clone if needed, explore structure, then read or locate only the specific content relevant to the question. Explain your findings clearly once you've gathered enough information — don't guess at code you haven't actually read."""
 
-def run_agent_turn(client, sandbox, messages, max_turns=MAX_TURNS):
+
+def run_agent_turn(client, sandbox, messages, profile: ProfileLog, max_turns=MAX_TURNS):
     """Runs tool-use turns until the model stops calling tools (i.e. gives a final text answer)."""
     for turn in range(1, max_turns + 1):
+        llm_start = time.perf_counter()
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
@@ -257,10 +312,19 @@ def run_agent_turn(client, sandbox, messages, max_turns=MAX_TURNS):
             messages=messages,
             tools=TOOLS,
         )
+        llm_elapsed = time.perf_counter() - llm_start
+        profile.event(
+            "llm_response",
+            turn=turn,
+            duration_s=llm_elapsed,
+            stop_reason=response.stop_reason,
+            input_tokens=getattr(response.usage, "input_tokens", None),
+            output_tokens=getattr(response.usage, "output_tokens", None),
+        )
 
         for block in response.content:
             if block.type == "text" and block.text.strip():
-                print(f"\n[assistant]: {block.text}")
+                print(f"\n{BLUE}[assistant]: {block.text}{RESET}")
 
         messages.append({"role": "assistant", "content": response.content})
 
@@ -271,37 +335,54 @@ def run_agent_turn(client, sandbox, messages, max_turns=MAX_TURNS):
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"[tool_call]: {block.name}({block.input})")
-            result = execute_tool(sandbox, block.name, block.input)
+            print(f"{RED}[tool_call]: {block.name}({block.input}){RESET}")
+
+            result, invoke_elapsed, run_elapsed = execute_tool(
+                sandbox, block.name, block.input
+            )
+            profile.event(
+                "tool_call",
+                turn=turn,
+                tool=block.name,
+                tool_input=block.input,
+                invoke_s=invoke_elapsed,
+                run_s=run_elapsed,
+                total_s=invoke_elapsed + run_elapsed,
+                result_chars=len(result) if isinstance(result, str) else None,
+            )
+
             tool_results.append(
                 {"type": "tool_result", "tool_use_id": block.id, "content": result}
             )
         messages.append({"role": "user", "content": tool_results})
 
     print("\n[warning] hit max_turns without a final response")
+    profile.event("max_turns_hit", max_turns=max_turns)
 
 
-def main(repo: str):
+def main(repo: str, profile_log: Path):
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     sandbox = Sandbox()
+    profile = ProfileLog(profile_log)
     messages = []
 
+    print(f"=== Profile log: {profile.path} (session {profile.session_id}) ===")
     print("=== Bootstrapping: cloning and exploring repo ===")
-    messages.append({
-        "role": "user",
-        "content": (
-            f"Clone the repository at {repo}, then run an initial exploration "
-            f"pass with list_dir (recurse into a few key subdirectories if the "
-            f"top level looks like a monorepo or has an obvious src/ layout). "
-            f"Briefly summarize what kind of project this looks like once done."
-        ),
-    })
-    run_agent_turn(client, sandbox, messages)
+    bootstrap = (
+        f"Clone the repository at {repo}, then run an initial exploration "
+        f"pass with list_dir (recurse into a few key subdirectories if the "
+        f"top level looks like a monorepo or has an obvious src/ layout). "
+        f"Briefly summarize what kind of project this looks like once done."
+    )
+    messages.append({"role": "user", "content": bootstrap})
+    profile.event("user_message", kind="bootstrap", chars=len(bootstrap), repo=repo)
+    run_agent_turn(client, sandbox, messages, profile)
 
     print("\n=== Repo ready. Ask questions about it (type 'exit' to quit) ===")
     while True:
         try:
-            user_input = input("\n[you]: ").strip()
+            user_input = input(f"\n{GREEN}[you]: ").strip()
+            print(RESET, end="")
         except EOFError:
             break
         if user_input.lower() in ("exit", "quit"):
@@ -310,13 +391,22 @@ def main(repo: str):
             continue
 
         messages.append({"role": "user", "content": user_input})
-        run_agent_turn(client, sandbox, messages)
+        profile.event("user_message", kind="query", chars=len(user_input))
+        run_agent_turn(client, sandbox, messages, profile)
+
+    profile.event("session_end")
+    print(f"\nProfile written to {profile.path}")
+    print(f"Graph it with: python ex_3_profile.py --log {profile.path}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=str, required=True)
+    parser.add_argument(
+        "--profile-log",
+        type=Path,
+        default=DEFAULT_PROFILE_LOG,
+        help="JSONL file for timing events (default: ex_3_profile.jsonl next to this script)",
+    )
     args = parser.parse_args()
-    main(args.repo)
-
-
-# git@github.com:iresharma/Variable-bitrate-Live-streamin-server.git
+    main(args.repo, args.profile_log)
