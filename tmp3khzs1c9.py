@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -15,7 +16,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import unquote, urlparse
 
 import tree_sitter_go as tsgo
 import tree_sitter_javascript as tsjs
@@ -28,16 +28,42 @@ MODEL = "claude-sonnet-4-6"
 MAX_TURNS = 25          # hard cap so a buggy loop can't run forever
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_PROFILE_LOG = SCRIPT_DIR / "ex_3_profile.jsonl"
+DEFAULT_LSP_LOG = SCRIPT_DIR / "ex_3_lsp.log"
+
+# Dedicated logger, separate from the "profile" JSONL and from root logging
+# (so importing anthropic/etc. doesn't spam this file). File handler gets
+# attached in __main__ once we know the actual log path from argparse.
+lsp_logger = logging.getLogger("lsp")
+lsp_logger.setLevel(logging.DEBUG)
+lsp_logger.propagate = False
 
 
 def resolve_log_path(path: Path) -> Path:
-    """Relative --profile-log paths go next to this script, not cwd."""
+    # Convert input to Path object in case it's a string
     path = Path(path)
+
+    # If the path is relative, anchor it to the script's directory
+    # instead of using the current working directory
     if not path.is_absolute():
         path = SCRIPT_DIR / path
+
+    # Create any missing parent directories for the resolved path
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Return the fully resolved absolute path (resolves symlinks and ".." etc.)
     return path.resolve()
 
+
+def setup_lsp_logging(path: Path) -> Path:
+    path = resolve_log_path(path)
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s: %(message)s")
+    )
+    lsp_logger.addHandler(handler)
+    lsp_logger.info("=" * 60)
+    lsp_logger.info("LSP debug logging started")
+    return path
 
 # Terminal colors: agent=blue, user=green, tool=red
 BLUE = "\033[94m"
@@ -195,13 +221,7 @@ TOOLS = [
     },
     {
         "name": "find_symbol",
-        "description": (
-            "uses tree-sitter to find exact symbols like functions and "
-            "variables in the code. Returns the symbol's source code "
-            "together with its 1-based line/character position, so the "
-            "result can be chained directly into goto_definition, "
-            "find_references, or hover without a separate lookup."
-        ),
+        "description": "uses tree-sitter to find exact symbols like functions and variables in the code",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -222,143 +242,16 @@ TOOLS = [
             "required": ["path", "symbol", "language"],
         },
     },
-    {
-        "name": "goto_definition",
-        "description": (
-            "Uses the language server (LSP) to jump to the definition of the "
-            "symbol at a specific position in a file. More precise than "
-            "find_symbol for resolving imports, usages, or symbols defined in "
-            "a different file — it understands scoping and type information, "
-            "not just name matching within a single file. Returns the file, "
-            "line, and column of each definition location found, plus a "
-            "preview of that source line. Only works for files whose language "
-            "has a configured server (python, go, javascript, typescript)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path to the file, e.g. 'src/utils.py'",
-                },
-                "line": {
-                    "type": "integer",
-                    "description": (
-                        "1-based line number containing the symbol, "
-                        "as you'd see it in an editor"
-                    ),
-                },
-                "character": {
-                    "type": "integer",
-                    "description": (
-                        "1-based column number of, or within, the symbol's "
-                        "name on that line"
-                    ),
-                },
-            },
-            "required": ["path", "line", "character"],
-        },
-    },
-    {
-        "name": "find_references",
-        "description": (
-            "Uses the language server (LSP) to find every usage of the "
-            "symbol at a specific position in a file, across the whole "
-            "indexed workspace, including the declaration itself. Use this "
-            "before renaming or changing a function/class/variable to see "
-            "everywhere it's used. Only works for files whose language has a "
-            "configured server (python, go, javascript, typescript)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path to the file, e.g. 'src/utils.py'",
-                },
-                "line": {
-                    "type": "integer",
-                    "description": (
-                        "1-based line number containing the symbol, "
-                        "as you'd see it in an editor"
-                    ),
-                },
-                "character": {
-                    "type": "integer",
-                    "description": (
-                        "1-based column number of, or within, the symbol's "
-                        "name on that line"
-                    ),
-                },
-            },
-            "required": ["path", "line", "character"],
-        },
-    },
-    {
-        "name": "hover",
-        "description": (
-            "Uses the language server (LSP) to get type information and "
-            "documentation for the symbol at a specific position in a file, "
-            "similar to hovering over it in an editor. Useful for checking a "
-            "function's signature, a variable's inferred type, or a "
-            "docstring without reading the full definition. Only works for "
-            "files whose language has a configured server (python, go, "
-            "javascript, typescript)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path to the file, e.g. 'src/utils.py'",
-                },
-                "line": {
-                    "type": "integer",
-                    "description": (
-                        "1-based line number containing the symbol, "
-                        "as you'd see it in an editor"
-                    ),
-                },
-                "character": {
-                    "type": "integer",
-                    "description": (
-                        "1-based column number of, or within, the symbol's "
-                        "name on that line"
-                    ),
-                },
-            },
-            "required": ["path", "line", "character"],
-        },
-    },
-    {
-        "name": "get_diagnostics",
-        "description": (
-            "Uses the language server (LSP) to return compiler/type-checker "
-            "diagnostics (errors, warnings, hints) for a file — the same "
-            "information shown as red/yellow squiggles in an editor. Opens "
-            "the file with the language server if it isn't already open. "
-            "Useful for checking whether a file has type errors or lint "
-            "issues without running a separate build. Only works for files "
-            "whose language has a configured server (python, go, javascript, "
-            "typescript)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative path to the file, e.g. 'src/utils.py'",
-                },
-            },
-            "required": ["path"],
-        },
-    },
 ]
 
 
 # ============================================================================
-# LSP client — JSON-RPC over stdio, per-language server configs, and a
-# manager that spawns/queries the right server based on file extension.
+# LSP client — generic JSON-RPC-over-stdio protocol client, per-language
+# server configs, and a manager that spawns/queries the right server based
+# on each file's extension (not tied to a single "project language" —
+# self.language on Sandbox is unrelated to this; LSPManager decides which
+# server to use per file, on demand, the first time that file is queried).
+# Not yet wired into any agent tool (see Sandbox.lsp) — usage comes later.
 # ============================================================================
 
 class LSPTimeoutError(RuntimeError):
@@ -367,6 +260,9 @@ class LSPTimeoutError(RuntimeError):
 
 class LSPClient:
     def __init__(self, cmd: list[str], cwd: str, env: dict | None = None):
+        self.cmd = cmd
+        self.cwd = cwd
+        lsp_logger.info(f"spawning: {' '.join(cmd)} (cwd={cwd})")
         self.proc = subprocess.Popen(
             cmd,
             cwd=cwd,
@@ -375,6 +271,7 @@ class LSPClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        lsp_logger.info(f"spawned pid={self.proc.pid} cmd={cmd[0]}")
         self._pending: dict[int, queue.Queue] = {}
         self._notifications: queue.Queue[dict] = queue.Queue()
         self._next_id = 1
@@ -415,11 +312,15 @@ class LSPClient:
     def _write_message(self, payload: dict):
         body = json.dumps(payload).encode("utf-8")
         header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        method = payload.get("method", "<response>")
+        msg_id = payload.get("id", "-")
+        lsp_logger.debug(f"--> [{self.cmd[0]}] id={msg_id} method={method}")
         try:
             with self._write_lock:
                 self.proc.stdin.write(header + body)
                 self.proc.stdin.flush()
         except (BrokenPipeError, OSError) as e:
+            lsp_logger.error(f"write failed for {method}: {e}")
             raise RuntimeError(f"LSP server process died: {e}")
 
     # ---------- background loops ----------
@@ -428,24 +329,33 @@ class LSPClient:
         while self._alive:
             try:
                 msg = self._read_message(self.proc.stdout)
-            except (OSError, ValueError, json.JSONDecodeError):
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                lsp_logger.error(f"[{self.cmd[0]}] reader loop error: {e}")
                 break
             if msg is None:
+                lsp_logger.info(f"[{self.cmd[0]}] stdout closed — server exited")
                 break
             if "id" in msg and ("result" in msg or "error" in msg):
+                lsp_logger.debug(
+                    f"<-- [{self.cmd[0]}] id={msg['id']} "
+                    f"{'error' if 'error' in msg else 'result'}"
+                )
                 q = self._pending.pop(msg["id"], None)
                 if q is not None:
                     q.put(msg)
             elif "method" in msg:
+                lsp_logger.debug(f"<-- [{self.cmd[0]}] notification method={msg['method']}")
                 # server->client request or notification (e.g. publishDiagnostics,
                 # or window/workDoneProgress/create which expects a response)
                 self._notifications.put(msg)
         self._alive = False
 
     def _stderr_drain(self):
-        # must drain or the pipe fills and blocks the server
-        for _ in iter(self.proc.stderr.readline, b""):
-            pass
+        # must drain or the pipe fills and blocks the server; also useful for debugging
+        for line in iter(self.proc.stderr.readline, b""):
+            text = line.decode("utf-8", "replace").rstrip()
+            if text:
+                lsp_logger.debug(f"[{self.cmd[0]} stderr] {text}")
 
     # ---------- public API ----------
 
@@ -464,8 +374,10 @@ class LSPClient:
             response = q.get(timeout=timeout)
         except queue.Empty:
             self._pending.pop(msg_id, None)
+            lsp_logger.error(f"[{self.cmd[0]}] {method} timed out after {timeout}s")
             raise LSPTimeoutError(f"{method} timed out after {timeout}s")
         if "error" in response:
+            lsp_logger.error(f"[{self.cmd[0]}] {method} returned error: {response['error']}")
             raise RuntimeError(f"{method} error: {response['error']}")
         return response.get("result")
 
@@ -483,20 +395,33 @@ class LSPClient:
         except queue.Empty:
             return None
 
+    def drain_notifications(self) -> list[dict]:
+        out = []
+        while True:
+            n = self.get_notification(timeout=0.0)
+            if n is None:
+                break
+            out.append(n)
+        return out
+
     def shutdown(self):
         if not self._alive:
             return
+        lsp_logger.info(f"[{self.cmd[0]}] shutting down pid={self.proc.pid}")
         try:
             self.request("shutdown", {}, timeout=5.0)
             self.notify("exit", {})
-        except (LSPTimeoutError, RuntimeError, OSError, BrokenPipeError):
+        except (LSPTimeoutError, RuntimeError, OSError, BrokenPipeError) as e:
+            lsp_logger.warning(f"[{self.cmd[0]}] shutdown handshake failed: {e}")
             self._alive = False
         else:
             self._alive = False
         try:
             self.proc.terminate()
             self.proc.wait(timeout=5.0)
+            lsp_logger.info(f"[{self.cmd[0]}] process exited cleanly")
         except (OSError, subprocess.TimeoutExpired):
+            lsp_logger.warning(f"[{self.cmd[0]}] did not exit in time, killing")
             self.proc.kill()
 
 
@@ -513,7 +438,12 @@ class LSPManager:
         # workspace/didChangeConfiguration — NOT from init_options.
         settings: dict = field(default_factory=dict)
 
-    # Shared across every LSPManager instance; read by _config_for_extension.
+    # Real class attributes — built once when the class is defined, shared
+    # across every LSPManager instance. This is what was broken before:
+    # they were being rebuilt as *instance* attributes inside __init__,
+    # while _config_for_extension (a classmethod) kept reading them off
+    # the class, which never had them. Same dict either way, but now it's
+    # actually reachable from where it's read.
     SERVER_CONFIGS: ClassVar[dict[str, ServerConfig]] = {
         "python": ServerConfig(
             language="python",
@@ -597,7 +527,9 @@ class LSPManager:
                 return client
 
         client = LSPClient(cfg.cmd, cwd=self.root)
-        client.request(
+        lsp_logger.info(f"[{cfg.language}] sending initialize request...")
+        init_start = time.monotonic()
+        result = client.request(
             "initialize",
             {
                 "processId": os.getpid(),
@@ -625,6 +557,12 @@ class LSPManager:
             },
             timeout=30.0,  # some servers are slow to boot the first time
         )
+        init_elapsed = time.monotonic() - init_start
+        server_name = (result or {}).get("serverInfo", {}).get("name", "unknown")
+        lsp_logger.info(
+            f"[{cfg.language}] initialized in {init_elapsed:.2f}s "
+            f"(server reports: {server_name})"
+        )
 
         # Listener must be running before `initialized` — pyright immediately
         # sends workspace/configuration and waits for the reply before it
@@ -639,6 +577,7 @@ class LSPManager:
         client.notify("initialized", {})
         if cfg.settings:
             client.notify("workspace/didChangeConfiguration", {"settings": cfg.settings})
+            lsp_logger.info(f"[{cfg.language}] sent workspace settings")
 
         with self._lock:
             existing = self._clients.get(key)
@@ -650,7 +589,10 @@ class LSPManager:
         return client
 
     def _notification_listener(self, client: LSPClient, cfg: ServerConfig):
-        """Handle server->client requests and cache publishDiagnostics."""
+        """
+        Runs for the lifetime of `client`. Server->client requests (with an
+        id) get a reply; notifications update caches and the log.
+        """
         while client._alive:
             note = client.get_notification(timeout=0.5)
             if note is None:
@@ -658,11 +600,38 @@ class LSPManager:
             if "id" in note and "method" in note:
                 self._handle_server_request(client, cfg, note)
                 continue
-            if note.get("method") == "textDocument/publishDiagnostics":
+            method = note.get("method")
+            if method == "textDocument/publishDiagnostics":
                 params = note.get("params", {})
                 uri = params.get("uri", "<unknown>")
+                diags = params.get("diagnostics", [])
                 with self._lock:
-                    self._diagnostics[uri] = params.get("diagnostics", [])
+                    self._diagnostics[uri] = diags
+                rel = uri.removeprefix(self.root_uri).lstrip("/")
+                if diags:
+                    lsp_logger.info(
+                        f"[{cfg.language}] diagnostics: {rel} — {len(diags)} issue(s)"
+                    )
+                    for d in diags[:5]:  # cap so one messy file doesn't flood the log
+                        sev = d.get("severity", "?")
+                        line = d.get("range", {}).get("start", {}).get("line", "?")
+                        msg = d.get("message", "").splitlines()[0][:120]
+                        lsp_logger.debug(f"    L{line} sev={sev}: {msg}")
+                else:
+                    lsp_logger.info(f"[{cfg.language}] diagnostics: {rel} — clean")
+            elif method == "$/progress":
+                value = note.get("params", {}).get("value", {})
+                kind = value.get("kind")
+                title = value.get("title") or value.get("message")
+                if kind:
+                    lsp_logger.info(f"[{cfg.language}] progress[{kind}]: {title}")
+            elif method == "window/logMessage":
+                params = note.get("params", {})
+                msg = (params.get("message") or "").strip()
+                if msg:
+                    lsp_logger.info(f"[{cfg.language}] {msg}")
+            else:
+                lsp_logger.debug(f"[{cfg.language}] unhandled notification: {method}")
 
     @staticmethod
     def _settings_section(settings: dict, section: str | None):
@@ -679,22 +648,37 @@ class LSPManager:
         method = note.get("method")
         msg_id = note["id"]
         params = note.get("params") or {}
+        lsp_logger.debug(f"[{cfg.language}] server request: {method} id={msg_id}")
         if method == "workspace/configuration":
             items = params.get("items") or [{}]
             result = [
                 self._settings_section(cfg.settings, item.get("section"))
                 for item in items
             ]
+            lsp_logger.info(
+                f"[{cfg.language}] workspace/configuration -> "
+                + ", ".join(
+                    item.get("section") or "<all>" for item in items
+                )
+            )
             client.reply(msg_id, result)
         elif method == "workspace/workspaceFolders":
             client.reply(
                 msg_id,
                 [{"uri": self.root_uri, "name": Path(self.root).name}],
             )
+        elif method in (
+            "window/workDoneProgress/create",
+            "client/registerCapability",
+            "client/unregisterCapability",
+        ):
+            client.reply(msg_id, None)
         else:
+            lsp_logger.warning(f"[{cfg.language}] unhandled server request: {method}")
             client.reply(msg_id, None)
 
     def shutdown_all(self):
+        lsp_logger.info("shutting down all LSP clients")
         for client in self._clients.values():
             client.shutdown()
         self._clients.clear()
@@ -708,13 +692,16 @@ class LSPManager:
         """
         cfg = self.SERVER_CONFIGS.get(language)
         if cfg is None:
+            lsp_logger.warning(f"warm_start: no server configured for '{language}'")
             return None
+        lsp_logger.info(f"warm_start: starting server for '{language}'")
         self._client_for(cfg)
         n = self.index_workspace(language)
-        self._wait_for_diagnostics(n)
+        self._wait_for_diagnostics(language, n)
+        lsp_logger.info(f"[{language}] warm_start opened {n} file(s) for indexing")
         return n
 
-    def _wait_for_diagnostics(self, opened: int, timeout: float = 20.0):
+    def _wait_for_diagnostics(self, language: str, opened: int, timeout: float = 20.0):
         """Block only the warm-start thread until diagnostics arrive or timeout."""
         if opened == 0:
             return
@@ -725,6 +712,12 @@ class LSPManager:
             if n >= opened:
                 break
             time.sleep(0.2)
+        with self._lock:
+            n = len(self._diagnostics)
+        lsp_logger.info(
+            f"[{language}] diagnostics received for {n} file(s) "
+            f"(opened {opened}, waited up to {timeout:.0f}s)"
+        )
 
     def _iter_source_files(self, extensions: tuple[str, ...], max_files: int):
         count = 0
@@ -755,6 +748,7 @@ class LSPManager:
             return None
         client = self._client_for(cfg)
         text = Path(full_path).read_text(errors="replace")
+        lsp_logger.debug(f"[{cfg.language}] didOpen: {rel_path}")
         client.notify(
             "textDocument/didOpen",
             {
@@ -779,8 +773,12 @@ class LSPManager:
             try:
                 if self._did_open(rel, cfg) is not None:
                     opened += 1
-            except OSError:
-                continue
+            except OSError as e:
+                lsp_logger.debug(f"[{language}] skip {rel}: {e}")
+        if opened >= max_files:
+            lsp_logger.warning(
+                f"[{language}] hit index cap of {max_files} files — rest left closed"
+            )
         return opened
 
     # ---------- file open + diagnostics ----------
@@ -817,6 +815,7 @@ class LSPManager:
             time.sleep(0.1)
 
         # no diagnostics arrived in time; treat as clean (common for valid files)
+        lsp_logger.debug(f"[{cfg.language}] no diagnostics for {rel_path} within {wait_timeout}s")
         self._diagnostics.setdefault(uri, [])
         return self._diagnostics[uri]
 
@@ -850,27 +849,49 @@ class Sandbox:
         self.workdir = os.path.abspath("ex_3_workspace")
         self._create_workspace()
 
-        # Workspace is usually empty until clone_repo runs, so language
-        # detection here is best-effort against leftovers from a previous run.
+        # NOTE: at this point the workspace is very likely EMPTY. Cloning
+        # doesn't happen here — it happens later, inside the agent's first
+        # tool call (clone_repo), driven by the LLM during the bootstrap
+        # turn. So detection here is best-effort against whatever's already
+        # on disk (e.g. a previous run's leftover clone); on a fresh
+        # workspace it will almost always come back None, and that's
+        # expected, not an error. We used to hard-fail here if it came back
+        # None — that was the bug: it required a repo to already be cloned
+        # before Sandbox could even be constructed, which is backwards
+        # given how bootstrap actually works.
         self.language = self._detect_project_language()
         self.lsp = LSPManager(self.workdir)
 
         if self.language is not None:
             self._start_lsp_warm_start()
+        else:
+            lsp_logger.info(
+                "Sandbox: no language detected yet (workspace likely empty) "
+                "— will detect + warm-start after clone_repo succeeds"
+            )
 
     def _create_workspace(self):
         os.makedirs(self.workdir, exist_ok=True)
 
     def _start_lsp_warm_start(self):
-        # Index in the background so the agent can explore while the server
-        # starts. Failures here (missing gopls, etc.) stay non-fatal; ask_lsp
-        # will surface an error if a tool later tries to use it.
+        # Runs indexing in the background rather than blocking on it —
+        # otherwise the server sits idle while the agent does its initial
+        # list_dir/read_file exploration, and the first real LSP query
+        # pays the full cold-start + indexing latency. A daemon thread
+        # means it can't block whatever called this, and if the toolchain
+        # for this language isn't installed (e.g. gopls missing), it fails
+        # quietly here rather than crashing the session — ask_lsp will
+        # surface a real error later if something actually tries to use it.
+        #
+        # Still not wired into any agent tool — no ask_lsp in TOOLS, no
+        # dispatch in _execute_tool. This just gets the server ready.
         print(f"{RED}[lsp] warm-starting '{self.language}'{RESET}")
         threading.Thread(
             target=self._warm_lsp, daemon=True, name="lsp-warm-start"
         ).start()
 
     def _warm_lsp(self):
+        lsp_logger.info(f"Sandbox: warm-starting LSP for detected language '{self.language}'")
         try:
             n = self.lsp.warm_start(self.language)
             if n is None:
@@ -883,6 +904,11 @@ class Sandbox:
                     f"{RED}[lsp] '{self.language}' indexed {n} file(s){RESET}"
                 )
         except Exception as e:
+            # Runs on a background thread — nothing is waiting on this, so
+            # there's no caller to propagate the exception to. Log and move
+            # on; the toolchain being missing (npx, gopls, etc.) shouldn't
+            # take down the whole agent session before it's even started.
+            lsp_logger.exception(f"warm start for '{self.language}' failed")
             print(f"{RED}[lsp] warm start for '{self.language}' failed: {e}{RESET}")
 
     def _detect_project_language(self, max_files: int = 5000):
@@ -944,12 +970,24 @@ class Sandbox:
         if result.returncode != 0:
             return f"Clone failed: {result.stderr}"
 
-        # First point the workspace has content, so re-detect language and
-        # start the LSP if we couldn't earlier. Non-fatal if detection fails.
+        # This is the first point where the workspace actually has content,
+        # so it's the first point where language detection can succeed.
+        # Re-run it now and, if a language wasn't already known (the usual
+        # case — see the comment in Sandbox.__init__), kick off the LSP
+        # warm-start here instead. Kept non-fatal: a language-detection
+        # miss (e.g. an unsupported language, or a truly empty repo)
+        # shouldn't break the clone itself.
         if self.language is None:
             self.language = self._detect_project_language()
             if self.language is not None:
+                lsp_logger.info(
+                    f"clone_repo: detected language '{self.language}' post-clone"
+                )
                 self._start_lsp_warm_start()
+            else:
+                lsp_logger.warning(
+                    "clone_repo: still could not detect a project language after clone"
+                )
 
         return "Cloned successfully"
 
@@ -1000,161 +1038,11 @@ class Sandbox:
             tree = parser.parse(file_bytes)
             node = self._find_named_node(tree.root_node, symbol_types, symbol, file_bytes)
 
-            if node is None:
-                return f"Symbol '{symbol}' not found in '{path}'"
-
-            # Report the position of the *name*, not the start of the whole
-            # definition (which may begin with decorators/comments/the def
-            # keyword) — that's the position goto_definition/find_references/
-            # hover expect, so this output can be chained straight into them.
-            name_node = node.child_by_field_name("name") or node
-            line = name_node.start_point[0] + 1
-            character = name_node.start_point[1] + 1
-            source = file_bytes[node.start_byte:node.end_byte].decode()
-
-            return (
-                f"Found '{symbol}' at {path}:{line}:{character} "
-                f"(pass this line/character to goto_definition, "
-                f"find_references, or hover)\n\n{source}"
-            )
+            if node:
+                return file_bytes[node.start_byte:node.end_byte].decode()
+            return f"Symbol '{symbol}' not found in '{path}'"
         except (OSError, ValueError, UnicodeDecodeError) as e:
             return f"Error finding symbol '{symbol}' in '{path}': {e}"
-
-    # ---------- LSP-backed tools ----------
-    # Thin formatting layer on top of LSPManager.ask_lsp /
-    # open_file_and_get_diagnostics. Tool-facing coordinates are 1-based
-    # (line and character) to match what an editor/model would naturally
-    # produce; LSP itself is 0-based, so every call here does the -1
-    # conversion on the way in and +1 on the way back out.
-
-    @staticmethod
-    def _uri_to_path(uri: str) -> str:
-        return unquote(urlparse(uri).path)
-
-    def _rel_from_uri(self, uri: str) -> str:
-        full = self._uri_to_path(uri)
-        try:
-            rel = os.path.relpath(full, self.workdir)
-        except ValueError:
-            return full
-        return rel.replace(os.sep, "/") if os.sep != "/" else rel
-
-    @staticmethod
-    def _normalize_locations(result) -> list[tuple[str, dict]]:
-        """LSP definition/references results can be None, a single Location,
-        a Location[], or a LocationLink[] — flatten all of those into a
-        uniform list of (uri, range) pairs."""
-        if not result:
-            return []
-        items = [result] if isinstance(result, dict) else result
-        locs = []
-        for item in items:
-            if "targetUri" in item:  # LocationLink
-                uri = item["targetUri"]
-                rng = item.get("targetSelectionRange") or item["targetRange"]
-            else:  # Location
-                uri = item["uri"]
-                rng = item["range"]
-            locs.append((uri, rng))
-        return locs
-
-    def _format_locations(self, locs: list[tuple[str, dict]], max_results: int = 20) -> str:
-        if not locs:
-            return "No results."
-        out = []
-        for uri, rng in locs[:max_results]:
-            rel = self._rel_from_uri(uri)
-            start = rng.get("start", {})
-            line_no = start.get("line", -1) + 1
-            col_no = start.get("character", -1) + 1
-            snippet = ""
-            try:
-                full = self._uri_to_path(uri)
-                with open(full, "r", errors="replace") as f:
-                    file_lines = f.readlines()
-                if 0 <= start.get("line", -1) < len(file_lines):
-                    snippet = file_lines[start["line"]].strip()
-            except OSError:
-                pass
-            entry = f"{rel}:{line_no}:{col_no}"
-            if snippet:
-                entry += f"  {snippet}"
-            out.append(entry)
-        if len(locs) > max_results:
-            out.append(f"... and {len(locs) - max_results} more")
-        return "\n".join(out)
-
-    @staticmethod
-    def _extract_hover_text(contents) -> str:
-        """Hover.contents can be a string, MarkupContent, MarkedString, or
-        MarkedString[] depending on the server — normalize to plain text."""
-        if contents is None:
-            return ""
-        if isinstance(contents, str):
-            return contents
-        if isinstance(contents, dict):
-            return contents.get("value", "")
-        if isinstance(contents, list):
-            parts = [
-                item if isinstance(item, str) else item.get("value", "")
-                for item in contents
-            ]
-            return "\n\n".join(p for p in parts if p)
-        return ""
-
-    def goto_definition(self, path: str, line: int, character: int):
-        try:
-            self._resolve(path)  # enforce sandbox boundary before hitting the LSP
-            result = self.lsp.ask_lsp(path, line - 1, character - 1, "definition")
-            locs = self._normalize_locations(result)
-            if not locs:
-                return f"No definition found at {path}:{line}:{character}"
-            return self._format_locations(locs)
-        except (LSPTimeoutError, RuntimeError, ValueError, OSError) as e:
-            return f"Error finding definition in '{path}' at {line}:{character}: {e}"
-
-    def find_references(self, path: str, line: int, character: int):
-        try:
-            self._resolve(path)
-            result = self.lsp.ask_lsp(path, line - 1, character - 1, "references")
-            locs = self._normalize_locations(result)
-            if not locs:
-                return f"No references found at {path}:{line}:{character}"
-            return self._format_locations(locs, max_results=50)
-        except (LSPTimeoutError, RuntimeError, ValueError, OSError) as e:
-            return f"Error finding references in '{path}' at {line}:{character}: {e}"
-
-    def hover(self, path: str, line: int, character: int):
-        try:
-            self._resolve(path)
-            result = self.lsp.ask_lsp(path, line - 1, character - 1, "hover")
-            text = self._extract_hover_text((result or {}).get("contents"))
-            return text.strip() if text and text.strip() else (
-                f"No hover information at {path}:{line}:{character}"
-            )
-        except (LSPTimeoutError, RuntimeError, ValueError, OSError) as e:
-            return f"Error getting hover info in '{path}' at {line}:{character}: {e}"
-
-    def get_diagnostics(self, path: str):
-        try:
-            self._resolve(path)
-            diags = self.lsp.open_file_and_get_diagnostics(path)
-            if not diags:
-                return f"No diagnostics for '{path}' (clean)."
-            sev_names = {1: "Error", 2: "Warning", 3: "Info", 4: "Hint"}
-            out = []
-            for d in diags:
-                start = d.get("range", {}).get("start", {})
-                line_no = start.get("line", -1) + 1
-                col_no = start.get("character", -1) + 1
-                sev = sev_names.get(d.get("severity"), "Diagnostic")
-                msg = d.get("message", "").strip()
-                source = d.get("source")
-                prefix = f"[{source}] " if source else ""
-                out.append(f"{path}:{line_no}:{col_no} {sev}: {prefix}{msg}")
-            return "\n".join(out)
-        except (LSPTimeoutError, RuntimeError, ValueError, OSError) as e:
-            return f"Error getting diagnostics for '{path}': {e}"
 
 
 class AgentLoop:
@@ -1165,19 +1053,13 @@ Available tools:
 - clone_repo(repo_url): clones a git repository into your working directory. Use this first if no repository is present yet.
 - list_dir(path): lists files and directories at a given path, non-recursive. Use this to explore structure before reading files — don't guess at paths.
 - read_file(path, start_line, end_line): returns the raw text of a file. start_line/end_line are optional; omit them to read the whole file, or use them to read a specific slice of a large file instead of the whole thing.
-- find_symbol(path, symbol, language): uses tree-sitter to locate the exact definition of a function, class, or method by name in a specific file, returning that symbol's source code plus its 1-based line/character position. Use this instead of read_file when you already know the name of what you're looking for and want its precise definition rather than the whole file. `language` must be one of: python, go, javascript, typescript. The position it returns can be passed directly into goto_definition, find_references, or hover — no need to re-derive coordinates with read_file.
-- goto_definition(path, line, character): uses the project's language server (LSP) to jump to where the symbol at a given position is actually defined, even if that's in a different file. Unlike find_symbol, this understands imports, scoping, and types, not just name-matching in one file — use it to resolve "where does this imported/called thing actually come from". `line` and `character` are 1-based, as in an editor; `character` can point anywhere inside the symbol's name.
-- find_references(path, line, character): uses the language server to find every place the symbol at a given position is used across the whole indexed workspace, including its declaration. Use this before explaining the impact of changing something, or before a rename, to see everywhere it's used. Same 1-based line/character convention as goto_definition. Typical flow: find_symbol to locate a definition by name and get its position, then find_references on that position to see every usage.
-- hover(path, line, character): uses the language server to get the type signature and any docstring/documentation for the symbol at a given position, without pulling in its full body. Good for a quick check of a function's signature or a variable's inferred type. Same 1-based line/character convention.
-- get_diagnostics(path): uses the language server to return compiler/type-checker errors, warnings, and hints for a file, the same information an editor would show as squiggles. Useful for checking whether a file has real issues before or after reasoning about it.
-
-The four LSP-backed tools (goto_definition, find_references, hover, get_diagnostics) only work for files whose language has a configured server: python, go, javascript, typescript. They also need a real line/character position to query — get one first from read_file output (which shows line-numbered-adjacent content you can count from) or from a find_symbol result, rather than guessing coordinates.
+- find_symbol(path, symbol, language): uses tree-sitter to locate the exact definition of a function, class, or method by name in a specific file, returning just that symbol's source code. Use this instead of read_file when you already know the name of what you're looking for and want its precise definition rather than the whole file. `language` must be one of: python, go, javascript, typescript.
 
 Working principles:
 
 1. Explore before acting. Use list_dir to understand repo structure before reading files. Don't assume file paths or names — verify them.
-2. Prefer the cheapest tool that answers your question. Use list_dir over read_file when you just need to know what exists. Use find_symbol over read_file when you know the specific name you're looking for and don't need surrounding context. Reach for the LSP tools (goto_definition, find_references, hover, get_diagnostics) specifically when the question is about relationships across the codebase (where is this defined elsewhere, who calls this, what's its type, does this file have errors) rather than about a single file's own contents.
-3. Tool results are ground truth, not suggestions. If a tool returns an error or "not found," don't assume the symbol/file exists elsewhere without checking — investigate with list_dir/read_file rather than guessing. If an LSP tool returns an error about the file's language not being configured, fall back to find_symbol/read_file instead of retrying.
+2. Prefer the cheapest tool that answers your question. Use list_dir over read_file when you just need to know what exists. Use find_symbol over read_file when you know the specific name you're looking for and don't need surrounding context.
+3. Tool results are ground truth, not suggestions. If a tool returns an error or "not found," don't assume the symbol/file exists elsewhere without checking — investigate with list_dir/read_file rather than guessing.
 4. Match the `language` argument to the actual file extension you're inspecting (.py -> python, .go -> go, .js -> javascript, .ts -> typescript). If a file's language isn't supported by find_symbol, fall back to read_file.
 5. Be economical with read_file on large files — use start_line/end_line once you have a rough idea where something is, rather than reading entire files repeatedly.
 6. All paths are relative to your sandboxed working directory. You cannot read or write anything outside it.
@@ -1213,22 +1095,6 @@ When asked to analyze or answer questions about a repository, work step by step:
         elif name == "find_symbol":
             fn = self.sandbox.find_symbol
             args = (tool_input["path"], tool_input["symbol"], tool_input["language"])
-            kwargs = {}
-        elif name == "goto_definition":
-            fn = self.sandbox.goto_definition
-            args = (tool_input["path"], tool_input["line"], tool_input["character"])
-            kwargs = {}
-        elif name == "find_references":
-            fn = self.sandbox.find_references
-            args = (tool_input["path"], tool_input["line"], tool_input["character"])
-            kwargs = {}
-        elif name == "hover":
-            fn = self.sandbox.hover
-            args = (tool_input["path"], tool_input["line"], tool_input["character"])
-            kwargs = {}
-        elif name == "get_diagnostics":
-            fn = self.sandbox.get_diagnostics
-            args = (tool_input["path"],)
             kwargs = {}
         else:
             invoke_elapsed = time.perf_counter() - invoke_start
@@ -1348,6 +1214,15 @@ if __name__ == "__main__":
         default=DEFAULT_PROFILE_LOG,
         help="JSONL file for timing events (default: ex_3_profile.jsonl next to this script)",
     )
+    parser.add_argument(
+        "--lsp-log",
+        type=Path,
+        default=DEFAULT_LSP_LOG,
+        help="Log file for LSP client/server activity (default: ex_3_lsp.log next to this script)",
+    )
     args = parser.parse_args()
+    args.lsp_log = setup_lsp_logging(args.lsp_log)
     args.profile_log = resolve_log_path(args.profile_log)
+    print(f"=== LSP debug log: {args.lsp_log} ===")
+    print(f"    tail -f {args.lsp_log}   # to watch it live in another terminal")
     AgentLoop(args.repo, args.profile_log).start_agent()
