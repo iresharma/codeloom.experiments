@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -138,13 +140,36 @@ IGNORE_DIRS = {
 # Cap background didOpen so a huge monorepo can't OOM the language server.
 INDEX_FILE_CAP = 500
 
+# Caps on a single read_file result, so one vendored 8k-line file can't
+# blow out the context window. The model is told when truncation happened
+# and which line to resume from, so it can page through deliberately.
+MAX_READ_LINES = 2000
+MAX_READ_BYTES = 250_000
+# Files with a NUL byte in the first block are binary; reading them yields
+# replacement-character garbage that costs tokens and teaches nothing.
+BINARY_SNIFF_BYTES = 8192
+
+# Search caps. A broad pattern on a big repo can match thousands of lines;
+# the model only needs enough to pick where to look next, and is told the
+# true total so it knows to narrow rather than assuming it saw everything.
+GREP_MAX_MATCHES = 60
+GREP_MAX_LINE_CHARS = 300
+FIND_FILES_MAX_RESULTS = 100
+SEARCH_TIMEOUT_S = 30
+
 TOOLS = [
     {
         "name": "read_file",
         "description": (
-            "Read and return the full text contents of a file at the given "
-            "path, relative to the working directory. Returns an error "
-            "message string if the file does not exist or can't be read."
+            "Read a file at the given path, relative to the working "
+            "directory. Returns the contents with a 1-based line-number "
+            "gutter ('   42\\tsource'), preceded by a header giving the line "
+            "range shown and the file's total line count. Line numbers are "
+            "true file positions even when reading a slice, so they can be "
+            "passed straight to the LSP tools. Long files are truncated at a "
+            "cap, with a note giving the start_line to resume from. Returns "
+            "an error message string if the file does not exist or can't be "
+            "read."
         ),
         "input_schema": {
             "type": "object",
@@ -163,6 +188,95 @@ TOOLS = [
                 },
             },
             "required": ["path"],
+        },
+    },
+    {
+        "name": "grep_search",
+        "description": (
+            "Search file *contents* across the repository for a regular "
+            "expression, like ripgrep. Returns matches grouped by file as "
+            "'line: content', so results can be fed straight into read_file "
+            "or the LSP tools. This is the right first move when you don't "
+            "yet know which file something lives in — much cheaper than "
+            "sweeping with list_dir and read_file. Automatically skips "
+            ".gitignore'd paths, binary files, and vendor/build directories. "
+            "Results are capped; the reply says how many total matches there "
+            "were, so narrow the pattern or path if you're near the cap."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Regular expression to search for, e.g. "
+                        "'def retry_policy' or 'class \\\\w+Client'. Set "
+                        "fixed_string if you want it treated as literal text."
+                    ),
+                },
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Optional relative directory or file to search under, "
+                        "e.g. 'src' or 'src/api/client.py'. Defaults to the "
+                        "whole workspace."
+                    ),
+                },
+                "glob": {
+                    "type": "string",
+                    "description": (
+                        "Optional filename filter, e.g. '*.py' or "
+                        "'**/test_*.go'. Prefix with '!' to exclude."
+                    ),
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "Match without regard to case. Default false.",
+                },
+                "fixed_string": {
+                    "type": "boolean",
+                    "description": (
+                        "Treat the pattern as a literal string rather than a "
+                        "regex. Use this for things containing regex "
+                        "metacharacters, e.g. 'config.get('. Default false."
+                    ),
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": (
+                        "Lines of surrounding context to show around each "
+                        "match, 0-5. Default 0."
+                    ),
+                },
+            },
+            "required": ["pattern"],
+        },
+    },
+    {
+        "name": "find_files",
+        "description": (
+            "Find files by *name or path pattern* across the repository, e.g. "
+            "'**/*_test.py' or 'config*'. Use this when you know roughly what "
+            "a file is called but not where it lives — it replaces walking "
+            "the tree with repeated list_dir calls. Use grep_search instead "
+            "when you're looking for something inside file contents."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "glob": {
+                    "type": "string",
+                    "description": (
+                        "Glob to match against the relative path, e.g. "
+                        "'**/*.go', 'test_*.py', 'src/**/index.ts'."
+                    ),
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional relative directory to search under.",
+                },
+            },
+            "required": ["glob"],
         },
     },
     {
@@ -963,18 +1077,347 @@ class Sandbox:
         except (OSError, ValueError) as e:
             return f"Error listing '{path}': {e}"
 
+    @staticmethod
+    def _looks_binary(full: str) -> bool:
+        try:
+            with open(full, "rb") as f:
+                return b"\x00" in f.read(BINARY_SNIFF_BYTES)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _number_lines(lines: list[str], first_lineno: int) -> str:
+        """Render lines as '   123\tsource', numbered from first_lineno.
+
+        The number is a display gutter, NOT part of the file content: a
+        `character` position counts columns in the source text after the
+        tab, which keeps read_file coordinates consistent with the ones
+        find_symbol returns and the LSP tools expect.
+        """
+        out = []
+        for offset, text in enumerate(lines):
+            out.append(f"{first_lineno + offset:>6}\t{text.rstrip(chr(10))}")
+        return "\n".join(out)
+
     def read_file(self, path: str, start_line: int | None = None, end_line: int | None = None):
         try:
             full = self._resolve(path)
+
+            if os.path.isdir(full):
+                return f"Error reading '{path}': it is a directory — use list_dir instead"
+            if self._looks_binary(full):
+                size = os.path.getsize(full)
+                return (
+                    f"'{path}' looks like a binary file ({size} bytes) — not shown. "
+                    f"Reading it would return unusable bytes."
+                )
+
             with open(full, "r", errors="replace") as f:
                 lines = f.readlines()
-            if start_line is None and end_line is None:
-                return "".join(lines)
-            start = (start_line or 1) - 1
-            end = end_line if end_line is not None else len(lines)
-            return "".join(lines[start:end])
+
+            total = len(lines)
+            if total == 0:
+                return f"'{path}' is empty (0 lines)"
+
+            # Clamp the requested window to the file, and remember where it
+            # actually starts so the gutter shows true file line numbers
+            # rather than restarting at 1 on every slice.
+            start = max(0, (start_line or 1) - 1)
+            end = total if end_line is None else min(end_line, total)
+            if start >= total:
+                return (
+                    f"Error reading '{path}': start_line {start_line} is past "
+                    f"the end of the file ({total} lines)"
+                )
+            if end <= start:
+                return (
+                    f"Error reading '{path}': end_line {end_line} is not after "
+                    f"start_line {start_line}"
+                )
+
+            window = lines[start:end]
+            requested = len(window)
+
+            # Truncate on whichever cap bites first.
+            truncated_at = None
+            if requested > MAX_READ_LINES:
+                window = window[:MAX_READ_LINES]
+                truncated_at = start + MAX_READ_LINES
+            running = 0
+            for i, text in enumerate(window):
+                running += len(text.encode("utf-8", errors="replace"))
+                if running > MAX_READ_BYTES:
+                    window = window[:i or 1]
+                    truncated_at = start + len(window)
+                    break
+
+            body = self._number_lines(window, start + 1)
+            shown_last = start + len(window)
+            header = (
+                f"{path} — lines {start + 1}-{shown_last} of {total} "
+                f"(gutter shows 1-based file line numbers; `character` counts "
+                f"columns in the source after the tab)"
+            )
+            footer = ""
+            if truncated_at is not None:
+                footer = (
+                    f"\n\n[truncated at the read_file cap — {total - truncated_at} "
+                    f"more line(s) in this file; continue with "
+                    f"start_line={truncated_at + 1}]"
+                )
+            return f"{header}\n\n{body}{footer}"
         except (OSError, ValueError) as e:
             return f"Error reading '{path}': {e}"
+
+    # ---------- content & filename search ----------
+    # ripgrep is the fast path: it honours .gitignore, skips binaries, and
+    # emits --json we can parse without guessing at ':' separators in paths.
+    # grep/os.walk is a correctness-equivalent fallback so the tool still
+    # works on a machine without rg installed, just slower and without
+    # .gitignore awareness (IGNORE_DIRS covers the worst of that).
+
+    _rg_path: ClassVar[str | None] = None
+    _rg_checked: ClassVar[bool] = False
+
+    @classmethod
+    def _ripgrep(cls) -> str | None:
+        if not cls._rg_checked:
+            cls._rg_path = shutil.which("rg")
+            cls._rg_checked = True
+        return cls._rg_path
+
+    @staticmethod
+    def _rg_text(field, placeholder: str = "") -> str:
+        """rg --json gives {'text': ...} normally, {'bytes': b64} for
+        non-UTF8 content. For line content, say so rather than emitting a
+        blank line that would read as an empty match; for paths, the
+        placeholder stays empty so the entry is skipped instead."""
+        if not isinstance(field, dict):
+            return ""
+        if "text" in field:
+            return field["text"]
+        if "bytes" in field:
+            return placeholder
+        return ""
+
+    @staticmethod
+    def _clip(line: str) -> str:
+        line = line.rstrip("\n").rstrip("\r")
+        if len(line) > GREP_MAX_LINE_CHARS:
+            return line[:GREP_MAX_LINE_CHARS] + f" ... [+{len(line) - GREP_MAX_LINE_CHARS} chars]"
+        return line
+
+    def _format_matches(self, hits: list[tuple[str, int, str, bool]], total: int,
+                        total_files: int, header: str) -> str:
+        """hits: (relpath, lineno, text, is_match). Grouped by file so the
+        path isn't repeated on every line."""
+        if not hits:
+            return f"No matches for {header}"
+
+        out = []
+        current = None
+        for path, lineno, text, is_match in hits:
+            if path != current:
+                out.append(f"\n{path}")
+                current = path
+            sep = ":" if is_match else "-"
+            out.append(f"{lineno:>6}{sep} {self._clip(text)}")
+
+        shown = sum(1 for h in hits if h[3])
+        summary = f"{total} match(es) in {total_files} file(s) for {header}"
+        if total > shown:
+            shown_files = len({h[0] for h in hits})
+            summary += (
+                f" — showing the first {shown} match(es) across "
+                f"{shown_files} file(s); narrow the pattern, add a glob, or "
+                f"scope with path to see the rest"
+            )
+        return summary + "\n" + "\n".join(out).lstrip("\n")
+
+    def _grep_via_rg(self, rg, pattern, search_root, glob, case_insensitive,
+                     fixed_string, context_lines):
+        cmd = [rg, "--json", "--sort", "path"]
+        if case_insensitive:
+            cmd.append("-i")
+        if fixed_string:
+            cmd.append("-F")
+        if context_lines:
+            cmd += ["-C", str(context_lines)]
+        if glob:
+            cmd += ["-g", glob]
+        cmd += ["--", pattern, search_root]
+
+        proc = subprocess.run(
+            cmd, cwd=self.workdir, capture_output=True, text=True,
+            check=False, timeout=SEARCH_TIMEOUT_S,
+        )
+        # rg exits 1 for "no matches" (not an error) and 2 for a real
+        # failure, e.g. an invalid regex — which the model needs to see.
+        if proc.returncode >= 2:
+            return None, (proc.stderr.strip() or "ripgrep failed")
+
+        hits, total, files = [], 0, set()
+        for raw in proc.stdout.splitlines():
+            try:
+                evt = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            kind = evt.get("type")
+            if kind not in ("match", "context"):
+                continue
+            data = evt["data"]
+            path = self._rg_text(data.get("path", {}))
+            text = self._rg_text(
+                data.get("lines", {}),
+                placeholder="[non-UTF8 line — read the file directly to inspect]",
+            )
+            lineno = data.get("line_number")
+            if lineno is None or not path:
+                continue
+            if kind == "match":
+                total += 1
+                files.add(path)
+            if len([h for h in hits if h[3]]) < GREP_MAX_MATCHES:
+                hits.append((path, lineno, text, kind == "match"))
+        return (hits, total, len(files)), None
+
+    def _grep_via_grep(self, pattern, search_root, glob, case_insensitive,
+                       fixed_string, context_lines):
+        cmd = ["grep", "-rn", "--binary-files=without-match"]
+        if case_insensitive:
+            cmd.append("-i")
+        cmd.append("-F" if fixed_string else "-E")
+        if context_lines:
+            cmd += ["-C", str(context_lines)]
+        for d in sorted(IGNORE_DIRS):
+            cmd.append(f"--exclude-dir={d}")
+        if glob:
+            # grep's --include matches the basename only, so a '**/' prefix
+            # would never match; strip it and let the directory walk do that
+            # part of the job.
+            cmd.append(f"--include={glob.lstrip('!').replace('**/', '')}")
+        cmd += ["-e", pattern, search_root]
+
+        proc = subprocess.run(
+            cmd, cwd=self.workdir, capture_output=True, text=True,
+            check=False, timeout=SEARCH_TIMEOUT_S,
+        )
+        if proc.returncode >= 2 and not proc.stdout:
+            return None, (proc.stderr.strip() or "grep failed")
+
+        hits, total, files = [], 0, set()
+        for raw in proc.stdout.splitlines():
+            # 'path:lineno:text' for matches, 'path-lineno-text' for context.
+            # Split on the first separator that yields an integer line number
+            # so paths containing '-' don't get mangled.
+            parsed = None
+            for sep, is_match in ((":", True), ("-", False)):
+                head, _, rest = raw.partition(sep)
+                num, _, text = rest.partition(sep)
+                if num.isdigit():
+                    parsed = (head, int(num), text, is_match)
+                    break
+            if parsed is None:
+                continue
+            path = os.path.relpath(
+                os.path.join(self.workdir, parsed[0]), self.workdir
+            )
+            if parsed[3]:
+                total += 1
+                files.add(path)
+            if len([h for h in hits if h[3]]) < GREP_MAX_MATCHES:
+                hits.append((path, parsed[1], parsed[2], parsed[3]))
+        return (hits, total, len(files)), None
+
+    def grep_search(self, pattern: str, path: str = ".", glob: str | None = None,
+                    case_insensitive: bool = False, fixed_string: bool = False,
+                    context_lines: int = 0):
+        try:
+            if not pattern:
+                return "Error: pattern is required"
+            self._resolve(path or ".")   # reject escapes before shelling out
+            search_root = path or "."
+            context_lines = max(0, min(int(context_lines or 0), 5))
+
+            header = f"pattern '{pattern}'"
+            if path not in (None, "", "."):
+                header += f" under '{path}'"
+            if glob:
+                header += f" matching '{glob}'"
+
+            rg = self._ripgrep()
+            if rg:
+                result, err = self._grep_via_rg(
+                    rg, pattern, search_root, glob, case_insensitive,
+                    fixed_string, context_lines,
+                )
+            else:
+                result, err = self._grep_via_grep(
+                    pattern, search_root, glob, case_insensitive,
+                    fixed_string, context_lines,
+                )
+            if err:
+                return f"Error searching for {header}: {err}"
+            hits, total, total_files = result
+            return self._format_matches(hits, total, total_files, header)
+        except subprocess.TimeoutExpired:
+            return (
+                f"Search for '{pattern}' timed out after {SEARCH_TIMEOUT_S}s — "
+                f"narrow it with a path or glob."
+            )
+        except (OSError, ValueError) as e:
+            return f"Error searching for '{pattern}': {e}"
+
+    def find_files(self, glob: str, path: str = "."):
+        try:
+            if not glob:
+                return "Error: glob is required"
+            root_full = self._resolve(path or ".")
+            if not os.path.isdir(root_full):
+                return f"Error: '{path}' is not a directory"
+
+            rg = self._ripgrep()
+            if rg:
+                proc = subprocess.run(
+                    [rg, "--files", "--sort", "path", "-g", glob, "--", path or "."],
+                    cwd=self.workdir, capture_output=True, text=True,
+                    check=False, timeout=SEARCH_TIMEOUT_S,
+                )
+                if proc.returncode >= 2:
+                    return f"Error finding files: {proc.stderr.strip() or 'ripgrep failed'}"
+                matches = [ln for ln in proc.stdout.splitlines() if ln]
+            else:
+                matches = []
+                for root, dirs, files in os.walk(root_full):
+                    dirs[:] = [
+                        d for d in dirs
+                        if d not in IGNORE_DIRS and not d.startswith(".")
+                    ]
+                    for fname in files:
+                        rel = os.path.relpath(
+                            os.path.join(root, fname), self.workdir
+                        ).replace(os.sep, "/")
+                        if fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(fname, glob):
+                            matches.append(rel)
+                matches.sort()
+
+            if not matches:
+                return f"No files matching '{glob}'" + (
+                    f" under '{path}'" if path not in (None, "", ".") else ""
+                )
+            total = len(matches)
+            shown = matches[:FIND_FILES_MAX_RESULTS]
+            body = "\n".join(shown)
+            if total > len(shown):
+                body += (
+                    f"\n\n[{total - len(shown)} more file(s) matched — "
+                    f"narrow the glob or scope with path]"
+                )
+            return f"{total} file(s) matching '{glob}':\n{body}"
+        except subprocess.TimeoutExpired:
+            return f"Finding files matching '{glob}' timed out after {SEARCH_TIMEOUT_S}s"
+        except (OSError, ValueError) as e:
+            return f"Error finding files matching '{glob}': {e}"
 
     def _find_named_node(self, root, symbol_types, symbol, source_bytes):
         stack = [root]
@@ -1164,19 +1607,21 @@ Available tools:
 
 - clone_repo(repo_url): clones a git repository into your working directory. Use this first if no repository is present yet.
 - list_dir(path): lists files and directories at a given path, non-recursive. Use this to explore structure before reading files — don't guess at paths.
-- read_file(path, start_line, end_line): returns the raw text of a file. start_line/end_line are optional; omit them to read the whole file, or use them to read a specific slice of a large file instead of the whole thing.
+- read_file(path, start_line, end_line): returns the text of a file with a 1-based line-number gutter, formatted as `   42\tsource`, after a header giving the range shown and the file's total line count. The gutter is display only — it is not part of the file, so a `character` position counts columns in the source text after the tab. Line numbers are always true file positions, so a slice read from line 300 is numbered from 300, not from 1. start_line/end_line are optional; omit them to read the whole file, or use them to read a specific slice of a large file instead of the whole thing. Very long reads are truncated at a cap and tell you the start_line to resume from — page through with a follow-up read rather than assuming you saw the end.
+- grep_search(pattern, path, glob, case_insensitive, fixed_string, context_lines): searches file *contents* across the repository for a regex and returns matches grouped by file as `line: content`. This is your primary way to find something when you don't already know which file it's in — reach for it before sweeping with list_dir and read_file. Set fixed_string when the pattern contains regex metacharacters you mean literally. Scope with path or glob to keep results tight. Results are capped, and the reply tells you the true total, so if you're at the cap, narrow rather than assuming you've seen everything. Feed a `file:line` hit into read_file (with start_line/end_line around it) or find_symbol to go deeper.
+- find_files(glob, path): finds files by name or path pattern, e.g. '**/*_test.py' or 'config*'. Use it when you know roughly what a file is called but not where it lives, instead of walking the tree with repeated list_dir calls.
 - find_symbol(path, symbol, language): uses tree-sitter to locate the exact definition of a function, class, or method by name in a specific file, returning that symbol's source code plus its 1-based line/character position. Use this instead of read_file when you already know the name of what you're looking for and want its precise definition rather than the whole file. `language` must be one of: python, go, javascript, typescript. The position it returns can be passed directly into goto_definition, find_references, or hover — no need to re-derive coordinates with read_file.
 - goto_definition(path, line, character): uses the project's language server (LSP) to jump to where the symbol at a given position is actually defined, even if that's in a different file. Unlike find_symbol, this understands imports, scoping, and types, not just name-matching in one file — use it to resolve "where does this imported/called thing actually come from". `line` and `character` are 1-based, as in an editor; `character` can point anywhere inside the symbol's name.
 - find_references(path, line, character): uses the language server to find every place the symbol at a given position is used across the whole indexed workspace, including its declaration. Use this before explaining the impact of changing something, or before a rename, to see everywhere it's used. Same 1-based line/character convention as goto_definition. Typical flow: find_symbol to locate a definition by name and get its position, then find_references on that position to see every usage.
 - hover(path, line, character): uses the language server to get the type signature and any docstring/documentation for the symbol at a given position, without pulling in its full body. Good for a quick check of a function's signature or a variable's inferred type. Same 1-based line/character convention.
 - get_diagnostics(path): uses the language server to return compiler/type-checker errors, warnings, and hints for a file, the same information an editor would show as squiggles. Useful for checking whether a file has real issues before or after reasoning about it.
 
-The four LSP-backed tools (goto_definition, find_references, hover, get_diagnostics) only work for files whose language has a configured server: python, go, javascript, typescript. They also need a real line/character position to query — get one first from read_file output (which shows line-numbered-adjacent content you can count from) or from a find_symbol result, rather than guessing coordinates.
+The four LSP-backed tools (goto_definition, find_references, hover, get_diagnostics) only work for files whose language has a configured server: python, go, javascript, typescript. They also need a real line/character position to query — get one first from a find_symbol result (which reports the exact position of the symbol's name) or from read_file's line-number gutter, rather than guessing coordinates. Prefer find_symbol when you know the name: it gives you both line and character exactly. From read_file you get the line for free from the gutter, but you still have to count the column yourself, so use it for positions find_symbol can't give you.
 
 Working principles:
 
-1. Explore before acting. Use list_dir to understand repo structure before reading files. Don't assume file paths or names — verify them.
-2. Prefer the cheapest tool that answers your question. Use list_dir over read_file when you just need to know what exists. Use find_symbol over read_file when you know the specific name you're looking for and don't need surrounding context. Reach for the LSP tools (goto_definition, find_references, hover, get_diagnostics) specifically when the question is about relationships across the codebase (where is this defined elsewhere, who calls this, what's its type, does this file have errors) rather than about a single file's own contents.
+1. Search before you walk. When you're looking for something specific and don't know where it lives, grep_search or find_files will find it in one call; list_dir plus read_file sweeps will take many. Use list_dir to orient yourself in an unfamiliar layout, not as a way to hunt for a known name. Don't assume file paths — verify them.
+2. Prefer the cheapest tool that answers your question. grep_search to find where something is mentioned at all. find_files to locate a file by name. list_dir when you just need to know what exists in one place. find_symbol when you know the name of a definition and want its precise source rather than the whole file. read_file when you need surrounding context, ideally with start_line/end_line around a hit you already have. Reach for the LSP tools (goto_definition, find_references, hover, get_diagnostics) specifically when the question is about relationships across the codebase (where is this defined elsewhere, who calls this, what's its type, does this file have errors) rather than about a single file's own contents. A good default chain for "how does X work" is grep_search to find X, then find_symbol on the most promising hit, then find_references from the position it returns.
 3. Tool results are ground truth, not suggestions. If a tool returns an error or "not found," don't assume the symbol/file exists elsewhere without checking — investigate with list_dir/read_file rather than guessing. If an LSP tool returns an error about the file's language not being configured, fall back to find_symbol/read_file instead of retrying.
 4. Match the `language` argument to the actual file extension you're inspecting (.py -> python, .go -> go, .js -> javascript, .ts -> typescript). If a file's language isn't supported by find_symbol, fall back to read_file.
 5. Be economical with read_file on large files — use start_line/end_line once you have a rough idea where something is, rather than reading entire files repeatedly.
@@ -1201,6 +1646,21 @@ When asked to analyze or answer questions about a repository, work step by step:
                 tool_input.get("start_line"),
                 tool_input.get("end_line"),
             )
+            kwargs = {}
+        elif name == "grep_search":
+            fn = self.sandbox.grep_search
+            args = ()
+            kwargs = {
+                "pattern": tool_input["pattern"],
+                "path": tool_input.get("path", "."),
+                "glob": tool_input.get("glob"),
+                "case_insensitive": tool_input.get("case_insensitive", False),
+                "fixed_string": tool_input.get("fixed_string", False),
+                "context_lines": tool_input.get("context_lines", 0),
+            }
+        elif name == "find_files":
+            fn = self.sandbox.find_files
+            args = (tool_input["glob"], tool_input.get("path", "."))
             kwargs = {}
         elif name == "list_dir":
             fn = self.sandbox.list_dir
